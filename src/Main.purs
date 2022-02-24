@@ -10,7 +10,10 @@ import Data.Maybe (Maybe, fromMaybe, optional)
 import Data.String as String
 import Effect (Effect)
 import Effect.Aff (Aff, error, launchAff_, throwError)
+import Effect.Aff.Class (liftAff)
+import Effect.Class (liftEffect)
 import Foreign (unsafeFromForeign, unsafeToForeign)
+import Node.Buffer (Buffer, fromString)
 import Node.Encoding (Encoding(..))
 import Node.FS.Aff (readTextFile)
 import Node.FS.Aff as FS
@@ -138,9 +141,10 @@ main = do
     source <- FS.readTextFile UTF8 input
     browser <- T.launch { headless }
     svg <- excalidrawRender browser opts.cdnVer source
-    case outputExt of
-      SVG -> FS.writeTextFile UTF8 output svg
-      PNG -> convertSvgToPng browser output svg
+    buf <- case outputExt of
+      SVG -> liftEffect $ fromString svg UTF8
+      PNG -> convertSvgToPng browser svg
+    FS.writeFile output buf
     when doClose $ T.close browser
 
 -- | MermaidAPI を利用してSVGを得る。
@@ -180,16 +184,22 @@ excalidrawRender browser cdnVer source = do
 -- | ビューポートは svg 要素以上の大きさが必要。生成される png 画像のサイズは変わらないが、
 -- | ビューポートからはみ出た部分は白抜きになる。
 -- | ?? viewport サイズ無指定の場合はどうなる？
-convertSvgToPng :: T.Browser -> FilePath -> String -> Aff Unit
-convertSvgToPng browser output svg = do
+--
+-- inkscapeやimagemagickを使う場合に比べて(依存を増やさない以外に)メリットはあるのか？
+--
+convertSvgToPng :: T.Browser -> String -> Aff Buffer
+convertSvgToPng browser svg = do
   page <- T.newPage browser
-  T.setContent indexHtml page
+  _ <- T.setContent indexHtml page
   clip' <- T.unsafePageEval (T.Selector "svg") svgRect page
-  let
-    clip = unsafeFromForeign clip'
-  _ <- T.screenshot { path: output, clip } page
-  pure unit
+  T.screenshot { clip: unsafeFromForeign clip' } page
   where
   indexHtml = "<!DOCTYPE html>\n<html><body>" <> svg <> "</body></html>"
 
-  svgRect = "(svg) => { const react = svg.getBoundingClientRect(); return { x: react.left, y: react.top, width: react.width, height: react.height } }"
+  svgRect =
+    """
+      (svg) => {
+        const react = svg.getBoundingClientRect();
+        return { x: react.left, y: react.top, width: react.width, height: react.height }
+      }
+    """
