@@ -57,7 +57,7 @@ optsParser = ado
             ( long "output"
                 <> short 'o'
                 <> metavar "PATH"
-                <> help "Output file. It should be either svg, png. Optional"
+                <> help "Output file. It should have either .svg or .png extension."
             )
     )
       <|> ( (OutputStdout <<< parseFormat)
@@ -65,7 +65,7 @@ optsParser = ado
                 ( long "stdout"
                     <> short 's'
                     <> metavar "svg|png"
-                    <> help "Output file. It should be either svg, png. Optional"
+                    <> help "Output format. It should be either svg or png."
                 )
         )
   cdnVer <-
