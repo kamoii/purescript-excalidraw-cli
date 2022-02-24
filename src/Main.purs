@@ -6,16 +6,12 @@ import Options.Applicative
 import Prelude
 
 import Control.Alt ((<|>))
-import Data.Maybe (Maybe, fromMaybe, optional)
-import Data.String as String
 import Effect (Effect)
 import Effect.Aff (Aff, error, launchAff_, throwError)
-import Effect.Aff.Class (liftAff)
 import Effect.Class (liftEffect)
 import Foreign (unsafeFromForeign, unsafeToForeign)
 import Node.Buffer (Buffer, fromString)
 import Node.Encoding (Encoding(..))
-import Node.FS.Aff (readTextFile)
 import Node.FS.Aff as FS
 import Node.Path (FilePath)
 import Node.Path as Path
@@ -88,9 +84,11 @@ optsParser = ado
       )
   in { input, output, cdnVer, debug }
 
+parseInput :: String -> Input
 parseInput = case _ of
   "-" -> InputStdin
   path -> InputFilePath path
+parseFormat :: String -> OutputExt
 
 parseFormat = case _ of
   "svg" -> SVG
