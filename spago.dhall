@@ -4,21 +4,22 @@ You can edit this file as you like.
 -}
 { name = "purescript-excalidraw-cli"
 , dependencies =
-  [ "console"
-  , "aff"
+  [ "aff"
+  , "console"
   , "control"
+  , "effect"
   , "either"
   , "foreign"
   , "maybe"
   , "node-buffer"
-  , "prelude"
-  , "strings"
-  , "effect"
   , "node-fs-aff"
   , "node-path"
   , "optparse"
+  , "partial"
+  , "prelude"
   , "psci-support"
   , "smolder"
+  , "strings"
   , "toppokki"
   ]
 , packages = ./packages.dhall
