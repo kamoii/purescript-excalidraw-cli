@@ -6,20 +6,28 @@ import Options.Applicative
 import Prelude
 
 import Control.Alt ((<|>))
+import Data.Either (Either(..))
+import Data.Maybe (Maybe(..))
+import Data.Newtype (unwrap, wrap)
 import Effect (Effect)
-import Effect.Aff (Aff, error, launchAff_, throwError)
+import Effect.Aff (Aff, error, launchAff_, throwError, try)
 import Effect.Class (liftEffect)
+import Effect.Class.Console (log)
+import Effect.Exception (throw)
 import Foreign (unsafeFromForeign, unsafeToForeign)
 import Node.Buffer (Buffer, fromString)
 import Node.Encoding (Encoding(..))
+import Node.FS.Aff (exists, mkdir, unlink)
 import Node.FS.Aff as FS
-import Node.Path (FilePath)
+import Node.Path (FilePath, dirname)
 import Node.Path as Path
+import Node.Process (getEnv, lookupEnv)
 import Partial.Unsafe (unsafeCrashWith)
 import Text.Smolder.HTML as S
 import Text.Smolder.HTML.Attributes as A
 import Text.Smolder.Markup (text, (!), safe)
 import Text.Smolder.Renderer.String (render)
+import Toppokki (Browser)
 import Toppokki as T
 
 type Options
@@ -88,8 +96,8 @@ parseInput :: String -> Input
 parseInput = case _ of
   "-" -> InputStdin
   path -> InputFilePath path
-parseFormat :: String -> OutputExt
 
+parseFormat :: String -> OutputExt
 parseFormat = case _ of
   "svg" -> SVG
   "png" -> PNG
@@ -115,35 +123,87 @@ cdnReactUrl = "https://unpkg.com/react/umd/react.production.min.js"
 cdnReactDomUrl :: String
 cdnReactDomUrl = "https://unpkg.com/react-dom/umd/react.production.min.js"
 
+type Config
+  = { wsEndpointPath :: FilePath
+    }
+
+mkConfig :: Effect Config
+mkConfig = do
+  homeDir <-
+    lookupEnv "HOME"
+      >>= case _ of
+          Just dir -> pure dir
+          Nothing -> throw "No home directory?"
+  let
+    rootDir = Path.concat [ homeDir, ".excalidraw-cli" ]
+  pure
+    { wsEndpointPath: Path.concat [ rootDir, "wsendpoint" ]
+    }
+
+envBackground = "EXCALIDRAW_BACKGROUND"
+
 -- headless が常駐って可能なのか？
 main :: Effect Unit
 main = do
-  opts <- execParser optsInfo
-  input <-
-    pure case opts.input of
-      InputStdin -> "/dev/stdin"
-      InputFilePath path -> path
-  output <-
-    pure case opts.output of
-      OutputStdout _ -> "/dev/stdout"
-      OutputFilePath path -> path
-  outputExt <- case opts.output of
-    OutputStdout ext -> pure ext
-    OutputFilePath path -> case Path.extname path of
-      ".svg" -> pure SVG
-      ".png" -> pure PNG
-      _ -> throwError (error "Unsupported output extension.")
-  headless <- pure $ not opts.debug
-  doClose <- pure $ not opts.debug
-  launchAff_ do
-    source <- FS.readTextFile UTF8 input
-    browser <- T.launch { headless }
-    svg <- excalidrawRender browser opts.cdnVer source
-    buf <- case outputExt of
-      SVG -> liftEffect $ fromString svg UTF8
-      PNG -> convertSvgToPng browser svg
-    FS.writeFile output buf
-    when doClose $ T.close browser
+  config <- mkConfig
+  lookupEnv envBackground >>= case _ of
+    Just _ ->
+      launchAff_ $ runHeadlessBrowser config
+    Nothing -> do
+      opts <- execParser optsInfo
+      input <-
+        pure case opts.input of
+          InputStdin -> "/dev/stdin"
+          InputFilePath path -> path
+      output <-
+        pure case opts.output of
+          OutputStdout _ -> "/dev/stdout"
+          OutputFilePath path -> path
+      outputExt <- case opts.output of
+        OutputStdout ext -> pure ext
+        OutputFilePath path -> case Path.extname path of
+          ".svg" -> pure SVG
+          ".png" -> pure PNG
+          _ -> throwError (error "Unsupported output extension.")
+      launchAff_ do
+        source <- FS.readTextFile UTF8 input
+        withBrowser config \browser -> do
+          svg <- excalidrawRender browser opts.cdnVer source
+          buf <- case outputExt of
+            SVG -> liftEffect $ fromString svg UTF8
+            PNG -> convertSvgToPng browser svg
+          FS.writeFile output buf
+
+-- puppeteerブラウザ起動して放置すれば勝手に走り続けるはず
+runHeadlessBrowser :: Config -> Aff Unit
+runHeadlessBrowser config = do
+  browser <- T.launch { headless: true }
+  wsEndpoint <- liftEffect $ T.wsEndpoint browser
+  let dir = dirname config.wsEndpointPath
+  unlessM (exists dir) $ mkdir dir
+  FS.writeTextFile UTF8 config.wsEndpointPath (unwrap wsEndpoint)
+  pure unit
+
+-- ブラウザをlaunchした場合、disconnectしても
+-- TODO: デバッグ起動対応
+withBrowser :: forall a. Config -> (Browser -> Aff a) -> Aff a
+withBrowser config action = do
+  browser <- tryConnect >>= case _ of
+    Left _ -> do
+      whenM (exists config.wsEndpointPath) $ FS.unlink config.wsEndpointPath
+      -- cp <- liftEffect $ ChildProcess.fork "" []
+      ?todo
+    Right b ->
+      pure b
+  a <- action browser
+  liftEffect $ T.disconnect browser
+  pure a
+  where
+    tryConnect =
+      try do
+        wsEndpoint <- wrap <$> FS.readTextFile UTF8 config.wsEndpointPath
+        T.connect { browserWSEndpoint: wsEndpoint }
+
 
 -- | MermaidAPI を利用してSVGを得る。
 -- | 一時的に画面には(hiddenな)DOMが追加されるが、最終的には何もない状態。
@@ -155,6 +215,7 @@ excalidrawRender browser cdnVer source = do
   page <- T.newPage browser
   T.setContent indexHtml page
   svg' <- T.unsafeEvaluateWithArgs renderFn [ unsafeToForeign source ] page
+  T.close page
   pure $ unsafeFromForeign svg'
   where
   renderFn :: String
@@ -201,3 +262,29 @@ convertSvgToPng browser svg = do
         return { x: react.left, y: react.top, width: react.width, height: react.height }
       }
     """
+
+-- purescript-node-process だと forkメソッドに引数が渡せなかった
+-- https://nodejs.org/api/child_process.html#child_processforkmodulepath-args-options
+-- https://nodejs.org/api/child_process.html#optionsdetached
+
+type ForkOptions =
+  ( cwd :: String
+  , detached :: Boolean
+  , stdio :: String
+  )
+
+fork
+  :: forall options trash
+   . Row.Union options trash ForkOptions
+  => String
+  -> Array String
+  -> { | options }
+  -> Effect ChildProcess
+fork = _fork
+
+unref :: ChildProcess -> Effect Unit
+unref = _unref
+
+foreign import data ChildProcess
+foreign import _fork :: forall options. String -> Array String -> options -> Effect ChildProcess
+foreign import _unref :: ChildProcess -> Effect Unit

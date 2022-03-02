@@ -8,9 +8,7 @@ You can edit this file as you like.
   , "console"
   , "control"
   , "effect"
-  , "either"
   , "foreign"
-  , "maybe"
   , "node-buffer"
   , "node-fs-aff"
   , "node-path"
@@ -19,8 +17,12 @@ You can edit this file as you like.
   , "prelude"
   , "psci-support"
   , "smolder"
-  , "strings"
   , "toppokki"
+  , "exceptions"
+  , "maybe"
+  , "newtype"
+  , "node-process"
+  , "either"
   ]
 , packages = ./packages.dhall
 , sources = [ "src/**/*.purs", "test/**/*.purs" ]
