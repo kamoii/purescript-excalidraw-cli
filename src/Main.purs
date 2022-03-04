@@ -1,5 +1,6 @@
 module Main
   ( main
+  , mainHeadlessBrowser
   ) where
 
 import Options.Applicative
@@ -9,8 +10,9 @@ import Control.Alt ((<|>))
 import Data.Either (Either(..))
 import Data.Maybe (Maybe(..))
 import Data.Newtype (unwrap, wrap)
+import Data.Time.Duration (Milliseconds(..))
 import Effect (Effect)
-import Effect.Aff (Aff, error, launchAff_, throwError, try)
+import Effect.Aff (Aff, delay, error, launchAff_, throwError, try)
 import Effect.Class (liftEffect)
 import Effect.Class.Console (log)
 import Effect.Exception (throw)
@@ -21,8 +23,9 @@ import Node.FS.Aff (exists, mkdir, unlink)
 import Node.FS.Aff as FS
 import Node.Path (FilePath, dirname)
 import Node.Path as Path
-import Node.Process (getEnv, lookupEnv)
+import Node.Process (execArgv, getEnv, lookupEnv)
 import Partial.Unsafe (unsafeCrashWith)
+import Prim.Row as Row
 import Text.Smolder.HTML as S
 import Text.Smolder.HTML.Attributes as A
 import Text.Smolder.Markup (text, (!), safe)
@@ -140,60 +143,83 @@ mkConfig = do
     { wsEndpointPath: Path.concat [ rootDir, "wsendpoint" ]
     }
 
-envBackground = "EXCALIDRAW_BACKGROUND"
-
 -- headless が常駐って可能なのか？
 main :: Effect Unit
 main = do
   config <- mkConfig
-  lookupEnv envBackground >>= case _ of
-    Just _ ->
-      launchAff_ $ runHeadlessBrowser config
-    Nothing -> do
-      opts <- execParser optsInfo
-      input <-
-        pure case opts.input of
-          InputStdin -> "/dev/stdin"
-          InputFilePath path -> path
-      output <-
-        pure case opts.output of
-          OutputStdout _ -> "/dev/stdout"
-          OutputFilePath path -> path
-      outputExt <- case opts.output of
-        OutputStdout ext -> pure ext
-        OutputFilePath path -> case Path.extname path of
-          ".svg" -> pure SVG
-          ".png" -> pure PNG
-          _ -> throwError (error "Unsupported output extension.")
-      launchAff_ do
-        source <- FS.readTextFile UTF8 input
-        withBrowser config \browser -> do
-          svg <- excalidrawRender browser opts.cdnVer source
-          buf <- case outputExt of
-            SVG -> liftEffect $ fromString svg UTF8
-            PNG -> convertSvgToPng browser svg
-          FS.writeFile output buf
+  opts <- execParser optsInfo
+  input <-
+    pure case opts.input of
+      InputStdin -> "/dev/stdin"
+      InputFilePath path -> path
+  output <-
+    pure case opts.output of
+      OutputStdout _ -> "/dev/stdout"
+      OutputFilePath path -> path
+  outputExt <- case opts.output of
+    OutputStdout ext -> pure ext
+    OutputFilePath path -> case Path.extname path of
+      ".svg" -> pure SVG
+      ".png" -> pure PNG
+      _ -> throwError (error "Unsupported output extension.")
+  launchAff_ do
+    source <- FS.readTextFile UTF8 input
+    withBrowser config \browser -> do
+      svg <- excalidrawRender browser opts.cdnVer source
+      buf <- case outputExt of
+        SVG -> liftEffect $ fromString svg UTF8
+        PNG -> convertSvgToPng browser svg
+      FS.writeFile output buf
 
 -- puppeteerブラウザ起動して放置すれば勝手に走り続けるはず
-runHeadlessBrowser :: Config -> Aff Unit
-runHeadlessBrowser config = do
-  browser <- T.launch { headless: true }
-  wsEndpoint <- liftEffect $ T.wsEndpoint browser
-  let dir = dirname config.wsEndpointPath
-  unlessM (exists dir) $ mkdir dir
-  FS.writeTextFile UTF8 config.wsEndpointPath (unwrap wsEndpoint)
-  pure unit
+-- forkして呼出すことを想定
+mainHeadlessBrowser :: Effect Unit
+mainHeadlessBrowser = do
+  config <- mkConfig
+  launchAff_ do
+    -- デバッグ時は headless: falseに
+    browser <- T.launch { headless: true }
+    -- browser <- T.launch { headless: false }
+    wsEndpoint <- liftEffect $ T.wsEndpoint browser
+    let dir = dirname config.wsEndpointPath
+    unlessM (exists dir) $ mkdir dir
+    FS.writeTextFile UTF8 config.wsEndpointPath (unwrap wsEndpoint)
+    -- いらないかも...
+    -- _ <- waitForever
+    pure unit
+  where
+    waitForever = do
+      delay (Milliseconds 10000000.0)
+      waitForever
+
 
 -- ブラウザをlaunchした場合、disconnectしても
 -- TODO: デバッグ起動対応
+-- https://nodejs.org/api/child_process.html#optionsdetached
 withBrowser :: forall a. Config -> (Browser -> Aff a) -> Aff a
 withBrowser config action = do
   browser <- tryConnect >>= case _ of
     Left _ -> do
+      log "restart chrome"
       whenM (exists config.wsEndpointPath) $ FS.unlink config.wsEndpointPath
-      -- cp <- liftEffect $ ChildProcess.fork "" []
-      ?todo
-    Right b ->
+      -- ???これ可能か???
+      cp <- liftEffect $ fork "?" []
+              { detached: true
+              , stdio: "ignore"
+              , execArgv: ["-e", "require(\"Main\").mainHeadlessBrowser()"]
+              }
+      liftEffect do
+        disconnect cp
+        unref cp
+      waitForChild 0
+      tryConnect >>= case _ of
+        Left _ ->
+          throwError (error "run failed")
+        Right b -> do
+          log "restarted"
+          pure b
+    Right b -> do
+      log "chrome running"
       pure b
   a <- action browser
   liftEffect $ T.disconnect browser
@@ -204,6 +230,10 @@ withBrowser config action = do
         wsEndpoint <- wrap <$> FS.readTextFile UTF8 config.wsEndpointPath
         T.connect { browserWSEndpoint: wsEndpoint }
 
+    waitForChild i = do
+      delay (Milliseconds 500.0)
+      when (i > 4) $ throwError (error "too long")
+      ifM (exists config.wsEndpointPath) (pure unit) (waitForChild (i + 1))
 
 -- | MermaidAPI を利用してSVGを得る。
 -- | 一時的に画面には(hiddenな)DOMが追加されるが、最終的には何もない状態。
@@ -215,7 +245,7 @@ excalidrawRender browser cdnVer source = do
   page <- T.newPage browser
   T.setContent indexHtml page
   svg' <- T.unsafeEvaluateWithArgs renderFn [ unsafeToForeign source ] page
-  T.close page
+  -- T.close page
   pure $ unsafeFromForeign svg'
   where
   renderFn :: String
@@ -271,6 +301,7 @@ type ForkOptions =
   ( cwd :: String
   , detached :: Boolean
   , stdio :: String
+  , execArgv :: Array String
   )
 
 fork
@@ -285,6 +316,10 @@ fork = _fork
 unref :: ChildProcess -> Effect Unit
 unref = _unref
 
-foreign import data ChildProcess
+disconnect :: ChildProcess -> Effect Unit
+disconnect = _disconnect
+
+foreign import data ChildProcess :: Type
 foreign import _fork :: forall options. String -> Array String -> options -> Effect ChildProcess
 foreign import _unref :: ChildProcess -> Effect Unit
+foreign import _disconnect :: ChildProcess -> Effect Unit
