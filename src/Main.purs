@@ -14,12 +14,15 @@ import Data.Newtype (unwrap, wrap)
 import Data.Time.Duration (Milliseconds(..))
 import Effect (Effect)
 import Effect.Aff (Aff, delay, error, launchAff_, throwError, try)
-import Effect.Class (liftEffect)
+import Effect.Aff.Class (class MonadAff)
+import Effect.Class (class MonadEffect, liftEffect)
 import Effect.Class.Console (log, timeLog)
 import Effect.Console (time)
 import Effect.Exception (throw)
 import Foreign (unsafeFromForeign, unsafeToForeign)
 import Node.Buffer (Buffer, fromString)
+import Node.Buffer as Buffer
+import Node.Crypto.Hash as Hash
 import Node.Encoding (Encoding(..))
 import Node.FS.Aff (exists, mkdir, unlink)
 import Node.FS.Aff as FS
@@ -130,6 +133,7 @@ cdnReactDomUrl = "https://unpkg.com/react-dom/umd/react.production.min.js"
 
 type Config
   = { wsEndpointPath :: FilePath
+    , cacheDir :: FilePath
     }
 
 mkConfig :: Effect Config
@@ -143,12 +147,24 @@ mkConfig = do
     rootDir = Path.concat [ homeDir, ".excalidraw-cli" ]
   pure
     { wsEndpointPath: Path.concat [ rootDir, "wsendpoint" ]
+    , cacheDir: Path.concat [ rootDir, "cache" ]
+    }
+
+type Logger =
+  { info :: forall m. MonadEffect m => String -> m Unit
+  }
+
+mkLogger :: Effect Logger
+mkLogger = do
+  pure
+    { info: pure <<< const unit :: forall m. MonadEffect m => String -> m Unit
     }
 
 -- headless が常駐って可能なのか？
 main :: Effect Unit
 main = do
-  config <- mkConfig
+  config@{cacheDir} <- mkConfig
+  logger <- mkLogger
   opts <- execParser optsInfo
   input <-
     pure case opts.input of
@@ -166,13 +182,9 @@ main = do
       _ -> throwError (error "Unsupported output extension.")
   launchAff_ do
     source <- FS.readTextFile UTF8 input
-    withBrowser config \browser -> do
-      -- svg <- excalidrawRender browser opts.cdnVer source
-      -- buf <- case outputExt of
-      --   SVG -> liftEffect $ fromString svg UTF8
-      --   PNG -> convertSvgToPng browser svg
-      buf <- excalidrawRender browser opts.cdnVer source outputExt
-      FS.writeFile output buf
+    buf <- withCache {cacheDir, source, outputExt} $ withBrowser logger config \browser -> do
+      excalidrawRender logger browser opts.cdnVer source outputExt
+    FS.writeFile output buf
 
 -- puppeteerブラウザ起動して放置すれば勝手に走り続けるはず
 -- forkして呼出すことを想定
@@ -192,11 +204,11 @@ mainHeadlessBrowser = do
 -- ブラウザをlaunchした場合、disconnectしても
 -- TODO: デバッグ起動対応
 -- https://nodejs.org/api/child_process.html#optionsdetached
-withBrowser :: forall a. Config -> (Browser -> Aff a) -> Aff a
-withBrowser config action = do
+withBrowser :: forall a. Logger -> Config -> (Browser -> Aff a) -> Aff a
+withBrowser logger config action = do
   browser <- tryConnect >>= case _ of
     Left _ -> do
-      log "restart chrome"
+      logger.info "restart chrome"
       whenM (exists config.wsEndpointPath) $ FS.unlink config.wsEndpointPath
       -- ???これ可能か???
       cp <- liftEffect $ fork "?" []
@@ -212,10 +224,10 @@ withBrowser config action = do
         Left _ ->
           throwError (error "run failed")
         Right b -> do
-          log "restarted"
+          logger.info "restarted"
           pure b
     Right b -> do
-      log "chrome running"
+      logger.info "chrome running"
       pure b
   a <- action browser
   liftEffect $ T.disconnect browser
@@ -231,12 +243,38 @@ withBrowser config action = do
       when (i > 4) $ throwError (error "too long")
       ifM (exists config.wsEndpointPath) (pure unit) (waitForChild (i + 1))
 
+-- 毎回同じファイルを
+withCache
+  :: { cacheDir :: String, source :: String, outputExt :: OutputExt }
+  -> Aff Buffer
+  -> Aff Buffer
+withCache { cacheDir, source, outputExt } gen = do
+  digest <- liftEffect $ sha256Digest source
+  let ext = case outputExt of
+        SVG -> ".svg"
+        PNG -> ".png"
+  let path = Path.concat [cacheDir, digest <> ext]
+  exists path >>=
+    if _
+    then
+      FS.readFile path
+    else do
+      buf <- gen
+      unlessM (exists cacheDir) $ mkdir cacheDir
+      FS.writeFile path buf
+      pure buf
+
+sha256Digest :: String -> Effect String
+sha256Digest s = do
+  buf <- Buffer.fromString s UTF8
+  Hash.createHash "sha512" >>= Hash.update buf >>= Hash.digest >>= Buffer.toString Hex
+
 -- | MermaidAPI を利用してSVGを得る。
 -- | 一時的に画面には(hiddenな)DOMが追加されるが、最終的には何もない状態。
 -- | ビューポートのサイズはレンダリングに影響を与えない。
 --
-excalidrawRender :: T.Browser -> String -> String -> OutputExt -> Aff Buffer
-excalidrawRender browser cdnVer source outputExt = do
+excalidrawRender :: Logger -> T.Browser -> String -> String -> OutputExt -> Aff Buffer
+excalidrawRender logger browser cdnVer source outputExt = do
   page <- findOrCreatePage
   case outputExt of
     SVG -> renderSvg page
@@ -247,10 +285,10 @@ excalidrawRender browser cdnVer source outputExt = do
     page' <- findM (\page -> (_ == title) <$> T.title page) pages
     case page' of
       Just page -> do
-        log "re-using page"
+        logger.info "re-using page"
         pure page
       Nothing -> do
-        log "new page"
+        logger.info "new page"
         page <- T.newPage browser
         T.setContent indexHtml page
         pure page
