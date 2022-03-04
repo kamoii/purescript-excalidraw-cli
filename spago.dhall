@@ -11,6 +11,7 @@ You can edit this file as you like.
   , "effect"
   , "either"
   , "exceptions"
+  , "foldable-traversable"
   , "foreign"
   , "maybe"
   , "newtype"

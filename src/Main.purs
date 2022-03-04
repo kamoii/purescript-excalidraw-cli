@@ -8,13 +8,15 @@ import Prelude
 
 import Control.Alt ((<|>))
 import Data.Either (Either(..))
-import Data.Maybe (Maybe(..))
+import Data.Foldable (class Foldable, foldM)
+import Data.Maybe (Maybe(..), maybe)
 import Data.Newtype (unwrap, wrap)
 import Data.Time.Duration (Milliseconds(..))
 import Effect (Effect)
 import Effect.Aff (Aff, delay, error, launchAff_, throwError, try)
 import Effect.Class (liftEffect)
-import Effect.Class.Console (log)
+import Effect.Class.Console (log, timeLog)
+import Effect.Console (time)
 import Effect.Exception (throw)
 import Foreign (unsafeFromForeign, unsafeToForeign)
 import Node.Buffer (Buffer, fromString)
@@ -165,10 +167,11 @@ main = do
   launchAff_ do
     source <- FS.readTextFile UTF8 input
     withBrowser config \browser -> do
-      svg <- excalidrawRender browser opts.cdnVer source
-      buf <- case outputExt of
-        SVG -> liftEffect $ fromString svg UTF8
-        PNG -> convertSvgToPng browser svg
+      -- svg <- excalidrawRender browser opts.cdnVer source
+      -- buf <- case outputExt of
+      --   SVG -> liftEffect $ fromString svg UTF8
+      --   PNG -> convertSvgToPng browser svg
+      buf <- excalidrawRender browser opts.cdnVer source outputExt
       FS.writeFile output buf
 
 -- puppeteerブラウザ起動して放置すれば勝手に走り続けるはず
@@ -184,14 +187,7 @@ mainHeadlessBrowser = do
     let dir = dirname config.wsEndpointPath
     unlessM (exists dir) $ mkdir dir
     FS.writeTextFile UTF8 config.wsEndpointPath (unwrap wsEndpoint)
-    -- いらないかも...
-    -- _ <- waitForever
     pure unit
-  where
-    waitForever = do
-      delay (Milliseconds 10000000.0)
-      waitForever
-
 
 -- ブラウザをlaunchした場合、disconnectしても
 -- TODO: デバッグ起動対応
@@ -239,23 +235,67 @@ withBrowser config action = do
 -- | 一時的に画面には(hiddenな)DOMが追加されるが、最終的には何もない状態。
 -- | ビューポートのサイズはレンダリングに影響を与えない。
 --
--- Excalidraw.exportToSvg({..}) : Promise
-excalidrawRender :: T.Browser -> String -> String -> Aff String
-excalidrawRender browser cdnVer source = do
-  page <- T.newPage browser
-  T.setContent indexHtml page
-  svg' <- T.unsafeEvaluateWithArgs renderFn [ unsafeToForeign source ] page
-  -- T.close page
-  pure $ unsafeFromForeign svg'
+excalidrawRender :: T.Browser -> String -> String -> OutputExt -> Aff Buffer
+excalidrawRender browser cdnVer source outputExt = do
+  page <- findOrCreatePage
+  case outputExt of
+    SVG -> renderSvg page
+    PNG -> renderPng page
   where
-  renderFn :: String
-  renderFn =
-    """
-      (source) => {
-        return Excalidraw.exportToSvg(JSON.parse(source))
-          .then(function(svg) { return (new XMLSerializer()).serializeToString(svg)});
-      }
-    """
+  findOrCreatePage = do
+    pages <- T.pages browser
+    page' <- findM (\page -> (_ == title) <$> T.title page) pages
+    case page' of
+      Just page -> do
+        log "re-using page"
+        pure page
+      Nothing -> do
+        log "new page"
+        page <- T.newPage browser
+        T.setContent indexHtml page
+        pure page
+
+  title :: String
+  title = "excalidraw-" <> cdnVer
+
+  -- Excalidraw.exportToSvg({..}) : Promise
+  -- exportToSvgで得られるSVGは文字列形式ではなくDOM形式。
+  renderSvg :: T.Page -> Aff Buffer
+  renderSvg page = do
+    svg <- T.unsafeEvaluateWithArgs code [ unsafeToForeign source ] page
+    liftEffect $ fromString (unsafeFromForeign svg) UTF8
+    where
+      code =
+        """
+          async (source) => {
+            const svg = await Excalidraw.exportToSvg(JSON.parse(source));
+            return (new XMLSerializer()).serializeToString(svg);
+          }
+        """
+
+  -- puppeteer は Blob/ArrayBuffer は渡せない。バイナリ文字列(基本非推奨だが..)経由で渡す。
+  -- ブラウザ側では FileReader.readAsBinaryString を使う。
+  --
+  --      const reader = new FileReader();
+  --      reader.readAsBinaryString(blob);
+  --      reader.onload = () => resolve(reader.result);
+  --
+  -- Node側は fromString + Binary で bufferに変換する
+  -- https://github.com/puppeteer/puppeteer/issues/3722
+  renderPng :: T.Page -> Aff Buffer
+  renderPng page = do
+    binstr <- T.unsafeEvaluateWithArgs code [ unsafeToForeign source ] page
+    liftEffect $ fromString (unsafeFromForeign binstr) Binary
+    where
+      code =
+        """
+          async (source) => {
+            const blob = await Excalidraw.exportToBlob({...JSON.parse(source), mimeType: "image/png"});
+            const reader = new FileReader();
+            reader.readAsBinaryString(blob);
+            return await new Promise((resolve, reject) => reader.onload = () => resolve(reader.result));
+          }
+        """
 
   indexHtml :: String
   indexHtml = render template
@@ -263,11 +303,19 @@ excalidrawRender browser cdnVer source = do
     template =
       S.html do
         S.head do
+          S.title $ text title
           S.script ! safe (A.src cdnReactUrl) ! A.type' "text/javascript" $ text ""
           S.script ! safe (A.src cdnReactDomUrl) ! A.type' "text/javascript" $ text ""
           S.script ! safe (A.src (cdnUrl cdnVer)) ! A.type' "text/javascript" $ text ""
         S.body do
           pure unit
+
+-- foldM :: forall f m a b. Foldable f => Monad m => (b -> a -> m b) -> b -> f a -> m b
+findM :: forall m a f. Foldable f => Monad m => (a -> m Boolean) -> f a -> m (Maybe a)
+findM pred =
+  foldM
+    (\ma a -> maybe (ifM (pred a) (pure (Just a)) (pure Nothing)) (pure <<< Just) ma)
+    Nothing
 
 -- | SVG を png 画像に変換する。
 -- | ビューポートは svg 要素以上の大きさが必要。生成される png 画像のサイズは変わらないが、
@@ -279,9 +327,11 @@ excalidrawRender browser cdnVer source = do
 convertSvgToPng :: T.Browser -> String -> Aff Buffer
 convertSvgToPng browser svg = do
   page <- T.newPage browser
-  _ <- T.setContent indexHtml page
-  clip' <- T.unsafePageEval (T.Selector "svg") svgRect page
-  T.screenshot { clip: unsafeFromForeign clip' } page
+  T.setContent indexHtml page
+  clip <- T.unsafePageEval (T.Selector "svg") svgRect page
+  buff <- T.screenshot { clip: unsafeFromForeign clip } page
+  T.closePage page
+  pure buff
   where
   indexHtml = "<!DOCTYPE html>\n<html><body>" <> svg <> "</body></html>"
 
